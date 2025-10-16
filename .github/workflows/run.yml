@@ -1,8 +1,11 @@
 name: US Market Signals
+
 on:
   schedule:
-    - cron: "*/15 13-20 * * 1-5"   # UTC 13:00–20:59 ≈ 美东09:00–16:59，每15分钟
+    # 每15分钟，UTC 11:00–21:59，工作日
+    - cron: "*/15 11-21 * * 1-5"
   workflow_dispatch:
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -11,9 +14,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install yfinance pandas numpy pytz requests
+      - run: pip install -r requirements.txt
       - name: Run bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
+          CHAT_ID:   ${{ secrets.CHAT_ID }}
+          # 下面两项可按需修改
+          STRATEGY:  conservative   # 或 aggressive
+          RUN_WINDOW: extended      # extended(含盘前/后) / regular(仅常规盘)
         run: python bot.py
