@@ -1,39 +1,41 @@
-# bot.py —— 美股信号机器人（5分钟级别）
-# 功能：SPY/QQQ/AAPL/MSFT/NVDA/AMD/MU/TXN/NEE/JNJ/TSLA/META/GOOGL/TSM/UNH
+# bot.py —— 美股信号机器人（5分钟级别，含兜底与双策略）
+# 监控：SPY/QQQ/AAPL/MSFT/NVDA/AMD/MU/TXN/NEE/JNJ/TSLA/META/GOOGL/TSM/UNH
 # 依赖：yfinance pandas numpy pytz requests
 # 密钥：从 GitHub Actions Secrets 读取 BOT_TOKEN / CHAT_ID
 
-import os, math, requests, pytz, datetime as dt
+import os, math, time, requests, pytz, datetime as dt
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
-# ====== 机密（来自 Actions → Secrets）======
+# ========= Telegram =========
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 CHAT_ID   = os.environ.get("CHAT_ID", "").strip()
 TG_URL    = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-# ====== 监控标的 ======
+# ========= 标的 =========
 TICKERS = [
     "SPY","QQQ","AAPL","MSFT","NVDA","AMD","MU","TXN","NEE","JNJ",
     "TSLA","META","GOOGL","TSM","UNH"
 ]
 
-# ====== 策略参数 ======
+# ========= 策略参数 =========
 RSI_LEN   = 14
 EMA_FAST  = 20
 EMA_SLOW  = 50
 MACD_FAST, MACD_SLOW, MACD_SIG = 12, 26, 9
 ATR_LEN   = 14
 VOL_SMA   = 20
-MIN_BARS  = 40              # 盘中前半段较少K线，用40根确保能计算
-VOLUME_BOOST = 1.2          # 放量阈值：成交量 >= 20均量 * 1.2
+MIN_BARS  = 40               # 5m 至少≈3.5小时
+VOLUME_BOOST = 1.2           # 放量阈值
 
-# ====== 运行窗口：regular(常规09:30–16:00 ET) / extended(含盘前07:00–09:30与盘后16:00–20:00) ======
+# ========= 运行窗口 =========
+# RUN_WINDOW: regular(09:30–16:00 ET) / extended(含盘前07:00–09:30 与盘后16:00–20:00)
 RUN_WINDOW = os.environ.get("RUN_WINDOW", "regular").lower()
+STRATEGY   = os.environ.get("STRATEGY", "conservative").lower()  # conservative / aggressive
 eastern    = pytz.timezone("US/Eastern")
 
-# ====== 名称映射（中英混排，快且稳定）======
+# ========= 名称映射（中文） =========
 NAME_MAP = {
     "SPY": "SPDR S&P 500 ETF（标普500）",
     "QQQ": "Invesco QQQ（纳指100）",
@@ -42,7 +44,7 @@ NAME_MAP = {
     "NVDA": "NVIDIA Corp.（英伟达）",
     "AMD": "Advanced Micro Devices（超微）",
     "MU":   "Micron Technology（美光）",
-    "TXN":  "Texas Instruments（德州仪器）",
+    "TXN":  "Texas Instruments（德仪）",
     "NEE":  "NextEra Energy（新纪元能源）",
     "JNJ":  "Johnson & Johnson（强生）",
     "TSLA":"Tesla, Inc.（特斯拉）",
@@ -55,14 +57,13 @@ NAME_MAP = {
 def company_name(ticker: str) -> str:
     name = NAME_MAP.get(ticker.upper())
     if name: return name
-    # 兜底：偶发请求，避免频繁调用导致限流
     try:
         info = yf.Ticker(ticker).get_info()
         return info.get("shortName") or info.get("longName") or ticker
     except Exception:
         return ticker
 
-# ====== 工具函数：保证一维 Series，修复 (n,1) 形状 ======
+# ========= 工具：一维化 =========
 def _series(x):
     if isinstance(x, pd.DataFrame):
         if x.shape[1] == 1:
@@ -75,12 +76,10 @@ def _series(x):
                 x = x.iloc[:, 0]
     return pd.Series(x, index=getattr(x, "index", None), dtype="float64").astype(float)
 
-def ema(s, n):
-    s = _series(s); return s.ewm(span=n, adjust=False).mean()
+def ema(s, n):       return _series(s).ewm(span=n, adjust=False).mean()
 
 def rsi(s, n=14):
-    s = _series(s)
-    d  = s.diff()
+    s  = _series(s); d = s.diff()
     up = np.where(d > 0, d, 0.0)
     dn = np.where(d < 0, -d, 0.0)
     ru = pd.Series(up, index=s.index).rolling(n, min_periods=n).mean()
@@ -107,27 +106,47 @@ def clean_df(df):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     for col in ["Open","High","Low","Close","Adj Close","Volume"]:
-        if col in df.columns:
-            df[col] = _series(df[col])
+        if col in df.columns: df[col] = _series(df[col])
     return df.dropna(how="any")
 
-# ====== 时间窗口判断 ======
+# ========= 稳健下载（重试 + 盘前后 + 兜底） =========
+def download_bars(ticker: str, interval: str = "5m", period: str = "10d", tries: int = 3):
+    last_err = None
+    for i in range(tries):
+        try:
+            df = yf.download(
+                ticker, period=period, interval=interval,
+                auto_adjust=False, prepost=True, progress=False,
+                timeout=30, threads=False, repair=True
+            )
+            if isinstance(df, pd.DataFrame) and len(df) > 0:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                return df
+        except Exception as e:
+            last_err = e
+        time.sleep(1.2 * (i + 1))
+    if last_err:
+        print(f"[download_bars] {ticker} {interval} failed: {last_err}")
+    return pd.DataFrame()
+
+# ========= 时间窗口 =========
 def within_window():
     now = dt.datetime.now(dt.timezone.utc).astimezone(eastern)
     if RUN_WINDOW == "regular":
-        start = now.replace(hour=9, minute=30, second=0, microsecond=0)
-        end   = now.replace(hour=16, minute=0, second=0, microsecond=0)
-        return start <= now <= end
-    else:  # extended
-        pre_s = now.replace(hour=7, minute=0, second=0, microsecond=0)
-        pre_e = now.replace(hour=9, minute=30, second=0, microsecond=0)
-        reg_s = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        s = now.replace(hour=9, minute=30, second=0, microsecond=0)
+        e = now.replace(hour=16, minute=0, second=0, microsecond=0)
+        return s <= now <= e
+    else:
+        pre_s = now.replace(hour=7,  minute=0, second=0, microsecond=0)
+        pre_e = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+        reg_s = now.replace(hour=9,  minute=30, second=0, microsecond=0)
         reg_e = now.replace(hour=16, minute=0, second=0, microsecond=0)
         aft_s = now.replace(hour=16, minute=0, second=0, microsecond=0)
         aft_e = now.replace(hour=20, minute=0, second=0, microsecond=0)
         return (pre_s <= now <= pre_e) or (reg_s <= now <= reg_e) or (aft_s <= now <= aft_e)
 
-# ====== 推送 ======
+# ========= 推送 =========
 def send(msg: str):
     if not (BOT_TOKEN and CHAT_ID):
         print("Telegram 未配置"); return
@@ -136,44 +155,39 @@ def send(msg: str):
     except Exception as e:
         print("Telegram error:", e)
 
-# ====== 双策略：稳健 conservative / 进取 aggressive （用环境变量 STRATEGY 选择）======
-STRATEGY = os.environ.get("STRATEGY", "conservative").lower()
-
+# ========= 双策略逻辑 =========
 def signal_logic(price, ema20, ema50, rsi_v, macd_up, macd_dn, vol_ok):
-    """
-    返回 ('buy'/'sell'/'hold', strength_tag)
-    strength_tag: "强势"/"普通"/None
-    """
     if STRATEGY == "aggressive":
         bull = (price > ema20) and macd_up and (rsi_v > 48)
         bear = (price < ema20) and macd_dn and (rsi_v < 52)
     else:  # conservative
         bull = (price > ema20 > ema50) and macd_up and (rsi_v > 50) and vol_ok
         bear = (price < ema20 < ema50) and macd_dn and (rsi_v < 50) and vol_ok
-
-    if bull:
-        return "buy", ("强势" if rsi_v > 60 else "普通")
-    if bear:
-        return "sell", ("强势" if rsi_v < 40 else "普通")
+    if bull: return "buy",  ("强势" if rsi_v > 60 else "普通")
+    if bear: return "sell", ("强势" if rsi_v < 40 else "普通")
     return "hold", None
 
 def position_advice(tag):
-    # 结合强度给出仓位
     if tag == "强势": return "重仓50%"
     if tag == "普通": return "中仓30%"
     return "轻仓10%"
 
-# ====== 单标的分析 ======
+# ========= 单标的分析 =========
 def analyze_one(ticker: str) -> str:
     cname = company_name(ticker)
-    try:
-        df = yf.download(ticker, period="5d", interval="5m", auto_adjust=False, progress=False)
-    except Exception as e:
-        return f"⚠️下载异常：{e}"
+
+    # 优先 5m，取不到则降级 15m→30m
+    df = download_bars(ticker, interval="5m",  period="10d", tries=3)
+    if df.empty or len(df) < MIN_BARS:
+        df = download_bars(ticker, interval="15m", period="30d", tries=2)
+    if df.empty or len(df) < max(24, MIN_BARS//3):
+        df = download_bars(ticker, interval="30m", period="60d", tries=2)
 
     df = clean_df(df)
-    if df.empty or len(df) < MIN_BARS:
-        return f"⚪️观望 | 理由：数据不足（bars={len(df)})"
+    if df.empty:
+        return f"⚠️数据源暂不可用（bars=0）"
+    if len(df) < MIN_BARS:
+        return f"⚪️观望 | 理由：盘中数据不足（bars={len(df)}，数据源延迟）"
 
     # 指标
     df["EMA20"]   = ema(df["Close"], EMA_FAST)
@@ -189,10 +203,12 @@ def analyze_one(ticker: str) -> str:
     ema20  = float(last["EMA20"])
     ema50  = float(last["EMA50"])
     rsi_v  = float(last["RSI"])
+
     macd_up = (last["MACD"] > last["MACDsig"]) and \
               (prev["MACD"] <= prev["MACDsig"] or last["MACDhist"] > prev["MACDhist"])
     macd_dn = (last["MACD"] < last["MACDsig"]) and \
               (prev["MACD"] >= prev["MACDsig"] or last["MACDhist"] < prev["MACDhist"])
+
     try:
         vol_ok = float(last["Volume"]) >= float(last["VolSMA"]) * VOLUME_BOOST
     except Exception:
@@ -211,7 +227,7 @@ def analyze_one(ticker: str) -> str:
         strength = "强势买入信号" if tag == "强势" else "买入"
         return (f"🟢{strength} | 价:{price:.2f} 止损:{stop:.2f} "
                 f"止盈:{tp:.2f} | 仓位建议：{pos}\n"
-                f"理由：价/均线:{price:.2f}>{ema20:.2f}>{ema50:.2f} "
+                f"理由：价/均线 {price:.2f}>{ema20:.2f}>{ema50:.2f} "
                 f"+ MACD转强 + RSI:{int(rsi_v)}{' + 放量' if vol_ok else ''}")
 
     if action == "sell":
@@ -220,17 +236,17 @@ def analyze_one(ticker: str) -> str:
         strength = "强势卖出信号" if tag == "强势" else "卖出"
         return (f"🔴{strength} | 价:{price:.2f} 止损:{stop:.2f} "
                 f"止盈:{tp:.2f} | 仓位建议：{pos}\n"
-                f"理由：价/均线:{price:.2f}<{ema20:.2f}<{ema50:.2f} "
+                f"理由：价/均线 {price:.2f}<{ema20:.2f}<{ema50:.2f} "
                 f"+ MACD转弱 + RSI:{int(rsi_v)}{' + 放量' if vol_ok else ''}")
 
     return (f"⚪️观望 | 理由：条件未齐（价:{price:.2f} "
             f"EMA20:{ema20:.2f} EMA50:{ema50:.2f} RSI:{int(rsi_v)})")
 
-# ====== 主流程 ======
+# ========= 主流程 =========
 def main():
     if not within_window():
-        window_note = "常规盘" if RUN_WINDOW=="regular" else "盘前/常规/盘后"
-        send(f"⏱ 当前不在设定时间窗（{window_note}），本次不推送。")
+        w = "常规盘" if RUN_WINDOW == "regular" else "盘前/常规/盘后"
+        send(f"⏱ 当前不在设定时间窗（{w}），本次不推送。")
         return
     lines = []
     for t in TICKERS:
