@@ -2,7 +2,7 @@ name: US Market Signals
 
 on:
   schedule:
-    # 每15分钟，UTC 11:00–21:59，工作日
+    # 每15分钟运行一次（UTC 11:00–21:59 ≈ 美东 07:00–17:59，覆盖盘前+常规盘+收盘后1小时）
     - cron: "*/15 11-21 * * 1-5"
   workflow_dispatch:
 
@@ -19,7 +19,6 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID:   ${{ secrets.CHAT_ID }}
-          # 下面两项可按需修改
-          STRATEGY:  conservative   # 或 aggressive
-          RUN_WINDOW: extended      # extended(含盘前/后) / regular(仅常规盘)
+          STRATEGY:  conservative    # conservative(稳健) / aggressive(进取)
+          RUN_WINDOW: extended       # extended(含盘前/后) / regular(仅常规盘)
         run: python bot.py
